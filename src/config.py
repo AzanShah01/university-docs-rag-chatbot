@@ -1,0 +1,8 @@
+"""Reusable application settings."""
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 60
+TOP_K = 3
+MIN_SIMILARITY_SCORE = 0.30
+EMBEDDING_BATCH_SIZE = 64

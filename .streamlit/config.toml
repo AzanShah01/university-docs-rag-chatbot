@@ -1,0 +1,15 @@
+[server]
+# PyTorch dynamic modules can confuse Streamlit's source-file watcher.
+fileWatcherType = "none"
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0F172A"
+font = "sans-serif"
