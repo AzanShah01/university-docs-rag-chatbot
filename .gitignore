@@ -9,3 +9,4 @@ env/
 *.log
 faiss_index/
 models/
+.agents/
