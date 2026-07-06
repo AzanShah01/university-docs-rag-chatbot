@@ -10,11 +10,21 @@ import numpy as np
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
 
-from src.config import EMBEDDING_BATCH_SIZE, MIN_SIMILARITY_SCORE, TOP_K
+from src.config import (
+    EMBEDDING_BATCH_SIZE,
+    MIN_KEYWORD_OVERLAP,
+    MIN_SIMILARITY_SCORE,
+    SECTION_QUERY_MAX_WORDS,
+    TOP_K,
+)
 from src.vector_store import FAISSVectorStore
 
 
 NO_ANSWER = "I could not find a clear answer in the uploaded documents."
+STRUCTURE_ONLY_ANSWER = (
+    "I found this topic in the document structure, but not enough explanatory "
+    "content was retrieved. Try asking a more specific question or check the section page."
+)
 STOP_WORDS = {
     "a", "an", "and", "are", "can", "did", "do", "does", "for", "from",
     "how", "in", "is", "of", "on", "the", "to", "was", "were", "what",
@@ -22,10 +32,82 @@ STOP_WORDS = {
 }
 STATISTICS_WORDS = {"count", "columns", "number", "records", "statistic", "statistics", "total"}
 INCOMPLETE_ENDINGS = {"and", "as", "because", "for", "from", "including", "of", "or", "such", "the", "to", "using", "with"}
+SECTION_PHRASES = {
+    "introduction",
+    "literature review",
+    "future work",
+    "system architecture",
+    "dataset collection",
+    "methodology",
+    "limitations",
+}
 
 
 def _words(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def meaningful_words(text: str) -> set[str]:
+    return _words(text) - STOP_WORDS
+
+
+def normalized_phrase(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def is_section_query(question: str, question_words: set[str]) -> bool:
+    normalized = normalized_phrase(question)
+    return (
+        len(question_words) <= SECTION_QUERY_MAX_WORDS
+        and any(phrase in normalized for phrase in SECTION_PHRASES)
+    )
+
+
+def phrase_matches(question: str, text: str) -> bool:
+    question_normalized = normalized_phrase(question)
+    text_normalized = normalized_phrase(text)
+    meaningful_phrase = " ".join(
+        word for word in question_normalized.split() if word not in STOP_WORDS
+    )
+    if len(meaningful_phrase.split()) >= 2 and meaningful_phrase in text_normalized:
+        return True
+    return any(
+        phrase in question_normalized and phrase in text_normalized
+        for phrase in SECTION_PHRASES
+    )
+
+
+def chunk_match_metadata(question: str, chunk: dict) -> dict:
+    """Compute lexical, phrase, section, and low-value reranking signals."""
+    question_words = meaningful_words(question)
+    text = chunk.get("text", "")
+    section_title = chunk.get("section_title", "")
+    chunk_words = meaningful_words(text)
+    section_words = meaningful_words(section_title)
+    keyword_overlap = len(question_words & chunk_words)
+    heading_overlap = len(question_words & section_words) / max(1, len(question_words))
+    exact_phrase = phrase_matches(question, text)
+    section_phrase = phrase_matches(question, section_title)
+    section_match = min(1.0, heading_overlap + (0.35 if section_phrase else 0.0))
+    heading_weight = 0.40 if is_section_query(question, question_words) else 0.25
+    keyword_score = min(
+        1.0,
+        keyword_overlap / max(1, min(len(question_words), 4)),
+    )
+    similarity = max(0.0, float(chunk.get("score", 0.0)))
+    combined_score = (
+        (0.55 * similarity)
+        + (0.18 * keyword_score)
+        + (0.12 if exact_phrase else 0.0)
+        + (heading_weight * section_match)
+        - (0.65 if chunk.get("low_value", False) else 0.0)
+    )
+    return {
+        "keyword_overlap": keyword_overlap,
+        "exact_phrase_match": exact_phrase,
+        "section_match": section_match,
+        "combined_score": max(-1.0, min(1.0, combined_score)),
+    }
 
 
 def looks_like_heading(text: str) -> bool:
@@ -129,8 +211,77 @@ class RAGPipeline:
         return len(self.vector_store)
 
     def retrieve(self, question: str, top_k: int = TOP_K) -> list[dict]:
+        """Retrieve broadly with FAISS, then rerank using document structure."""
         query_embedding = self._encode([question])
-        return self.vector_store.search(query_embedding, top_k=top_k)
+        candidate_count = min(len(self.chunks), max(30, top_k * 6))
+        semantic_candidates = self.vector_store.search(
+            query_embedding,
+            top_k=candidate_count,
+        )
+        candidates_by_id = {
+            candidate["chunk_id"]: candidate for candidate in semantic_candidates
+        }
+
+        # Add strong lexical/heading matches even if FAISS placed them below its window.
+        for chunk in self.chunks:
+            if chunk["chunk_id"] in candidates_by_id:
+                continue
+            lexical_candidate = dict(chunk)
+            lexical_candidate["score"] = 0.0
+            metadata = chunk_match_metadata(question, lexical_candidate)
+            if (
+                metadata["keyword_overlap"] >= MIN_KEYWORD_OVERLAP
+                or metadata["exact_phrase_match"]
+                or metadata["section_match"] >= 0.35
+            ):
+                candidates_by_id[chunk["chunk_id"]] = lexical_candidate
+
+        reranked = []
+        for candidate in candidates_by_id.values():
+            ranked_candidate = dict(candidate)
+            ranked_candidate.update(chunk_match_metadata(question, ranked_candidate))
+            reranked.append(ranked_candidate)
+        reranked.sort(key=lambda item: item["combined_score"], reverse=True)
+        selected = reranked[:top_k]
+        structural_match = next(
+            (
+                item for item in reranked
+                if item.get("low_value", False)
+                and (
+                    item.get("keyword_overlap", 0) >= MIN_KEYWORD_OVERLAP
+                    or item.get("exact_phrase_match", False)
+                    or item.get("section_match", 0.0) >= 0.35
+                )
+            ),
+            None,
+        )
+        if structural_match and structural_match not in selected:
+            if len(selected) >= top_k:
+                selected[-1] = structural_match
+            else:
+                selected.append(structural_match)
+            selected.sort(key=lambda item: item["combined_score"], reverse=True)
+        return selected
+
+    @staticmethod
+    def _is_meaningful_match(
+        question: str,
+        source: dict,
+        min_similarity: float,
+    ) -> bool:
+        structural_signal = bool(
+            source.get("keyword_overlap", 0) >= MIN_KEYWORD_OVERLAP
+            or source.get("exact_phrase_match", False)
+            or source.get("section_match", 0.0) >= 0.35
+        )
+        if structural_signal:
+            return True
+        semantic_threshold = (
+            max(0.45, min_similarity)
+            if is_section_query(question, meaningful_words(question))
+            else min_similarity
+        )
+        return source.get("score", 0.0) >= semantic_threshold
 
     def _extract_answer(
         self,
@@ -139,14 +290,14 @@ class RAGPipeline:
         min_similarity: float,
     ) -> tuple[str, float]:
         """Return the strongest non-duplicate source sentences and their score."""
-        if not sources or sources[0]["score"] < min_similarity:
+        if not sources:
             return NO_ANSWER, 0.0
 
-        question_words = _words(question) - STOP_WORDS
+        question_words = meaningful_words(question)
         wants_tabular_answer = bool(question_words & STATISTICS_WORDS)
         candidates: list[tuple[str, float, float]] = []
         for source in sources:
-            units = split_units(source["text"])[:30]
+            units = split_units(source["text"])[:40]
             anchor_positions = []
             for position, unit in enumerate(units):
                 unit_words = _words(unit)
@@ -163,9 +314,17 @@ class RAGPipeline:
                     (abs(position - anchor) for anchor in anchor_positions),
                     default=4,
                 )
-                heading_proximity = max(0.0, 1.0 - (distance / 4.0))
+                heading_proximity = max(
+                    0.0,
+                    1.0 - (distance / 4.0),
+                    0.75 * source.get("section_match", 0.0),
+                )
                 candidates.append(
-                    (sentence, max(0.0, source["score"]), heading_proximity)
+                    (
+                        sentence,
+                        max(0.0, source.get("combined_score", 0.0)),
+                        heading_proximity,
+                    )
                 )
 
         if not candidates:
@@ -177,28 +336,29 @@ class RAGPipeline:
 
         ranked: list[tuple[float, str]] = []
         for index, (sentence, chunk_score, heading_proximity) in enumerate(candidates):
-            sentence_words = _words(sentence)
+            sentence_words = meaningful_words(sentence)
             lexical_score = len(question_words & sentence_words) / max(1, len(question_words))
-            phrase_bonus = 0.08 if question.lower() in sentence.lower() else 0.0
+            phrase_bonus = 0.08 if phrase_matches(question, sentence) else 0.0
             table_penalty = 0.20 if is_table_fragment(sentence) else 0.0
             combined_score = (
-                (0.45 * float(semantic_scores[index]))
+                (0.40 * float(semantic_scores[index]))
                 + (0.30 * chunk_score)
                 + (0.20 * lexical_score)
-                + (0.10 * heading_proximity)
+                + (0.15 * heading_proximity)
                 + phrase_bonus
                 - table_penalty
             )
             ranked.append((combined_score, sentence))
         ranked.sort(key=lambda item: item[0], reverse=True)
 
-        if not ranked or ranked[0][0] < min_similarity:
+        sentence_threshold = 0.18
+        if not ranked or ranked[0][0] < sentence_threshold:
             return NO_ANSWER, ranked[0][0] if ranked else 0.0
 
         selected: list[str] = []
         seen_words: list[set[str]] = []
         for score, sentence in ranked:
-            if score < min_similarity or len(selected) >= 3:
+            if score < sentence_threshold or len(selected) >= 5:
                 break
             words = _words(sentence)
             is_duplicate = any(
@@ -246,28 +406,57 @@ class RAGPipeline:
                 "confidence_score": 0.0,
                 "guidance": "",
                 "answer_found": False,
+                "structure_only": False,
             }
 
         retrieved = self.retrieve(clean_question, top_k=top_k)
-        top_similarity = retrieved[0]["score"] if retrieved else 0.0
-        relevant_sources = [
-            source for source in retrieved if source["score"] >= min_similarity
+        meaningful_sources = [
+            source
+            for source in retrieved
+            if self._is_meaningful_match(clean_question, source, min_similarity)
         ]
-        answer, answer_score = self._extract_answer(
-            clean_question,
-            relevant_sources,
-            min_similarity,
+        useful_sources = [
+            source for source in meaningful_sources if not source.get("low_value", False)
+        ]
+        structural_sources = [
+            source for source in meaningful_sources if source.get("low_value", False)
+        ]
+
+        structure_only = False
+        if useful_sources:
+            answer, answer_score = self._extract_answer(
+                clean_question,
+                useful_sources,
+                min_similarity,
+            )
+            sources = useful_sources[:top_k]
+        elif structural_sources:
+            answer = STRUCTURE_ONLY_ANSWER
+            answer_score = structural_sources[0].get("combined_score", 0.0)
+            sources = structural_sources[:top_k]
+            structure_only = True
+        else:
+            answer = NO_ANSWER
+            answer_score = 0.0
+            sources = []
+
+        has_answer = answer not in {NO_ANSWER, STRUCTURE_ONLY_ANSWER}
+        confidence_score = (
+            sources[0].get("combined_score", 0.0) if sources else 0.0
         )
-        has_answer = answer != NO_ANSWER
-        confidence = self._confidence_label(top_similarity, answer_score, has_answer)
-        sources = (relevant_sources if relevant_sources else retrieved)[:top_k]
+        confidence = self._confidence_label(
+            confidence_score,
+            answer_score,
+            has_answer,
+        )
         return {
             "question": clean_question,
             "answer": answer,
             "sources": sources,
             "confidence": confidence,
-            "confidence_score": top_similarity,
+            "confidence_score": confidence_score,
             "answer_found": has_answer,
+            "structure_only": structure_only,
             "guidance": (
                 "This answer is based on weak document matches. Please verify from the source evidence."
                 if confidence == "Low confidence" and has_answer
