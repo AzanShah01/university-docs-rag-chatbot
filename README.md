@@ -110,7 +110,20 @@ The page appears before the machine-learning model loads. Model loading begins o
 
 ## Screenshots
 
-Add screenshots of the running application to the `screenshots/` directory before publishing the project. Suggested screenshots include the upload screen, processed-document summary, answer, and expanded source evidence.
+### Home Page
+![Home Page](screenshots/home.PNG)
+
+### Document Processing
+![Document Processing](screenshots/processing.PNG)
+
+### Documents Processed
+![Documents Processed](screenshots/processed.PNG)
+
+### Answer Result
+![Answer Result](screenshots/answer.PNG)
+
+### Source Evidence
+![Source Evidence](screenshots/sources.PNG)
 
 ## Limitations
 
